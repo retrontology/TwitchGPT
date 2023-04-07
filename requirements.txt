@@ -1,0 +1,6 @@
+irc
+markovify
+emoji
+PyYAML
+twitchAPI
+retroBot

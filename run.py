@@ -5,7 +5,7 @@ import datetime
 import time
 
 
-openai.api_key = "geturownkey"
+openai.api_key = ""
 seed = 'who'
 base_model = 'ada'
 api_type = 'open_ai'
@@ -17,10 +17,10 @@ def setup_logger(name):
     return logging.getLogger(name)
 
 def main():
-    fine_tuning_job = create_model(training_file, model=base_model)
-    wait_for_fine_tuning(fine_tuning_job)
-    tuned_model = stream_fine_tuning(fine_tuning_job)
-    print(tuned_model)
+    #fine_tuning_job = create_model(training_file, model=base_model)
+    #wait_for_fine_tuning(fine_tuning_job)
+    #tuned_model = stream_fine_tuning(fine_tuning_job)
+    print(generate_message('ada'))
 
 def upload_file(file = None, content = None):
 
@@ -113,6 +113,10 @@ def stream_fine_tuning(job_id):
     elif resp["status"] == "failed":
         logger.error(f'Fine tuning model creation has failed!')
         return None
+
+def generate_message(model, max_tokens=64, stop=['\n'], **kwargs):
+    generator = openai.Completion.create(model=model, max_tokens=max_tokens, stop=stop, **kwargs)
+    return generator.choices[0].text
 
 if __name__ == "__main__":
     logger = setup_logger('TwitchGPT')
