@@ -1,4 +1,5 @@
 import openai
+from openai.upload_progress import BufferReader
 import retroBot.channelHandler
 from retroBot.message import message
 import os
@@ -44,37 +45,21 @@ class GPTHandler(retroBot.channelHandler):
         sqlite3.register_converter("BOOLEAN", lambda v: bool(int(v)))
         cursor = connection.cursor()
         cursor.execute('PRAGMA journal_mode=WAL')
+        self.initMessageDB(cursor)
+        self.initConfigDB(cursor)
+        self.initModelDB(cursor)
         connection.commit()
         cursor.close()
         connection.close()
-        self.initMessageDB()
-        self.initConfigDB()
-        self.initModelDB()
 
-    def initMessageDB(self):
-        connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
-        cursor = connection.cursor()
-        cursor.execute('PRAGMA journal_mode=WAL')
-        cursor.execute('create table if not exists messages(date timestamp, user_id integer, name text, mod BOOLEAN, message text)')
-        connection.commit()
-        cursor.close()
-        connection.close()
+    def initMessageDB(self, cursor):
+        cursor.execute('create table if not exists messages(message TEXT NOT NULL)')
     
-    def initConfigDB(self):
-        connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
-        cursor = connection.cursor()
-        cursor.execute('create table if not exists config(key text, value text)')
-        connection.commit()
-        cursor.close()
-        connection.close()
+    def initConfigDB(self, cursor):
+        cursor.execute('create table if not exists config(key TEXT NOT NULL, value TEXT)')
 
-    def initModelDB(self):
-        connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
-        cursor = connection.cursor()
-        cursor.execute('create table if not exists models(iteration integer, date timestamp, message_count integer, model text)')
-        connection.commit()
-        cursor.close()
-        connection.close()
+    def initModelDB(self, cursor):
+        cursor.execute('create table if not exists models(iteration INTEGER NOT NULL PRIMARY KEY, date TIMESTAMP NOT NULL, message_count INTEGER NOT NULL, model TEXT NOT NULL)')
     
     def on_pubmsg(self, c, e):
         msg = message(e)
@@ -92,8 +77,8 @@ class GPTHandler(retroBot.channelHandler):
         if self.message_count >= self.generate_on:
             self.generateAndSendMessage()
     
-    def generateMessage(self):
-        generator = openai.Completion.create(model=self.model, max_tokens=self.max_tokens, stop=['\n'])
+    def generateMessage(self, **kwargs):
+        generator = openai.Completion.create(model=self.model, max_tokens=self.max_tokens, stop=['\n'], **kwargs)
         return generator.choices[0].text
 
     def generateAndSendMessage(self, target=None):
@@ -110,14 +95,13 @@ class GPTHandler(retroBot.channelHandler):
             if self.send_messages: self.send_message(generated)
         else:
             self.logger.error("Could not generate a message :(")
-        self.checkCull()
 
     def writeMessage(self, msg):
         message = self.filterMessage(msg.content)
         if message:
             connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
             cursor = connection.cursor()
-            cursor.execute('insert into messages values (?, ?, ?, ?, ?)', (msg.time, msg.user_id, msg.username, msg.mod, message))
+            cursor.execute('insert into messages values (?)', (message))
             connection.commit()
             cursor.close()
             connection.close()
@@ -142,12 +126,16 @@ class GPTHandler(retroBot.channelHandler):
         message = message.strip()
         return message
 
-    def fineTuneModel(self, poll_interval=POLL_INTERVAL):
-        dataset_file = self.prepareDataSet()
-        create_args = {"training_file": dataset_file}
-        resp = openai.FineTune.create(**create_args)
-        job_id = resp['id']
+    def fineTuneModel(self, poll_interval=POLL_INTERVAL, **kwargs):
 
+        dataset = self.retrieveDataSet()
+        cutoff_row = dataset[-1][0]
+        dataset_length = len(dataset)
+        dataset = self.formatDataSet(dataset)
+        dataset = self.uploadDataSet(dataset)
+
+        resp = openai.FineTune.create(training_file=dataset, **kwargs)
+        job_id = resp['id']
         self.logger.info(f"Created fine-tuning job: {job_id}")
         self.logger.debug(resp)
 
@@ -158,67 +146,97 @@ class GPTHandler(retroBot.channelHandler):
             status = resp['status']
             self.logger.debug(resp)
         
+        finished = False
         events = openai.FineTune.stream_events(job_id)
-        try:
-            for event in events:
-                self.logger.info(
-                    "[%s] %s"
-                    % (
-                        datetime.datetime.fromtimestamp(event["created_at"]),
-                        event["message"],
+        while finished == False:
+            try:
+                for event in events:
+                    self.logger.info(
+                        "[%s] %s"
+                        % (
+                            datetime.datetime.fromtimestamp(event["created_at"]),
+                            event["message"],
+                        )
                     )
-                )
-        except Exception as e:
-            self.logger.warning(f'Experienced the following exception while waiting for fine tuning to finish. Will retry: {e}')
-            events = None
-            while events == None:
-                try:
-                    resp = openai.FineTune.retrieve(id=job_id)
-                    if resp["status"] in ['pending', 'running']:
-                        events = openai.FineTune.stream_events(job_id)
-                    else:
-                        break
-                except Exception as e:
-                    self.logger.warning(f'Experienced the following exception while retrying connection to fine tuning job. Will retry: {e}')
+                finished = True
+            except Exception as e:
+                self.logger.warning(f'Experienced the following exception while waiting for fine tuning to finish. Will retry: {e}')
+                events = None
+                while events == None:
+                    try:
+                        resp = openai.FineTune.retrieve(id=job_id)
+                        if resp["status"] in ['pending', 'running']:
+                            events = openai.FineTune.stream_events(job_id)
+                        else:
+                            finished = True
+                    except Exception as e:
+                        self.logger.warning(f'Experienced the following exception while retrying connection to fine tuning job. Will retry: {e}')
 
         resp = openai.FineTune.retrieve(id=job_id)
         self.logger.debug(resp)
 
-        #bookmark TODO
         if resp["status"] == "succeeded":
             self.logger.info(f'Fine tuning model creation has succeeded! The resulting model is: {resp["fine_tuned_model"]}')
+            created_date = datetime.datetime.fromtimestamp(resp["result_files"]["created_at"])
+            self.setModel(resp["fine_tuned_model"], dataset_length, created_date)
+            self.pruneMessages(cutoff_row)
             return resp["fine_tuned_model"]
         elif resp["status"] == "failed":
             self.logger.error(f'Fine tuning model creation has failed!')
             return None
-        return resp["id"]
+        else:
+            self.logger.error(f'Fine tuning model creation has exploded! My god!')
+            return None
 
-    def prepareDataSet(self):
+    def setModel(self, model, dataset_length, created_date):
+        self.model = model
         connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
         cursor = connection.cursor()
-        return "somedatasetfilename"
-
-    def cullFile(self):
-        connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
-        cursor = connection.cursor()
-        size = cursor.execute('select count(*) from messages').fetchall()[0][0]
-        self.logger.debug(f'Size of messages: {size}')
-        if size > self.parent.cull_over:
-            size_delete = size // 2
-            self.logger.debug(f'Culling rows below: {size_delete}')
-            cursor.execute('delete from messages where rowid < ?', (size_delete,))
-            connection.commit()
-            cursor.execute('vacuum')
+        cursor.execute('insert into models values (?, ?, ?, ?)', (None, created_date, dataset_length, model))
+        connection.commit()
         cursor.close()
         connection.close()
+
+    def retrieveDataSet(self):
+        connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
+        cursor = connection.cursor()
+        cursor.execute('select rowid, message from messages')
+        rows = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        self.logger.debug(f'Retrieved rows {rows[0][0]} through {rows[-1][0]}')
+        return rows
     
-    def checkCull(self):
-        now_time = datetime.datetime.now()
-        time_since_cull = now_time - self.last_cull
-        self.logger.debug(f'Time since last cull: {time_since_cull.total_seconds()}')
-        if time_since_cull.total_seconds() > self.parent.time_to_cull:
-            self.cullFile()
-            self.last_cull = datetime.datetime.now()
+    def formatDataSet(self, dataset):
+        jsonl_content = ""
+        for row in dataset:
+            jsonl_content += '{"prompt": "\n", "completion": "' + row[1] + '"}\n'
+        return jsonl_content
+    
+    def uploadDataSet(self, dataset):
+        file_name = f"{self.channel}_{time.time()}"
+        buffer_reader = BufferReader(dataset, desc="Upload progress")
+        resp = openai.File.create(
+            file=buffer_reader,
+            purpose="fine-tune",
+            user_provided_filename=file_name
+        )
+        self.logger.debug(
+            "Uploaded file from {file}: {id}".format(
+                file=file_name, id=resp["id"]
+            )
+        )
+        return resp["id"]
+
+    def pruneMessages(self, cutoff_row):
+        connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
+        cursor = connection.cursor()
+        cursor.execute('delete from messages where rowid <= ?', (cutoff_row,))
+        connection.commit()
+        cursor.execute('vacuum')
+        connection.commit()
+        cursor.close()
+        connection.close()
     
     def handleCommands(self, msg):
         cmd = msg.content.split(' ')[0][1:].lower()
