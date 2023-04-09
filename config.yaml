@@ -1,0 +1,30 @@
+gpt:
+  api_key: 
+  defaults:
+    generate_on: 500
+    ignored_users:
+    - nightbot
+    - streamlabs
+    - streamelements
+    max_tokens: 64
+    message_count_cutoff: 2000
+    send_messages: false
+twitch:
+  channels:
+    summit1g:
+      generate_on: 500
+      ignored_users:
+      - nightbot
+      - streamlabs
+      - streamelements
+      - fossabot
+      - xhipgamer
+      max_tokens: 64
+      message_count_cutoff: 500
+      send_messages: false
+  client_id: 
+  client_secret: 
+  irc:
+    port: 6667
+    server: irc.chat.twitch.tv
+  username: itsmesmile420

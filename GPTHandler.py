@@ -7,23 +7,22 @@ import re
 import datetime
 import sqlite3
 import time
+import json
+from threading import Thread
 
 POLL_INTERVAL=5
+BASE_MODEL='ada'
 
 class GPTHandler(retroBot.channelHandler):
 
     def __init__(self, channel, parent, *args, **kwargs):
         super().__init__(channel, parent)
         self.user_id = parent.twitch.get_users(logins=[channel.lower()])['data'][0]['id']
-        self.message_count = 0
+        self.initConfig()
         self.initDB()
-        self.last_train = datetime.datetime.now()
-        self.model = parent.config['twitch']['channels'][channel]['model']
-        self.max_tokens = parent.config['twitch']['channels'][channel]['max_tokens']
-        self.send_messages = parent.config['twitch']['channels'][channel]['send_messages']
-        self.generate_on = parent.config['twitch']['channels'][channel]['generate_on']
-        self.ignored_users = [x.lower() for x in self.parent.config['twitch']['channels'][channel]['ignored_users']]
         self.initCooldowns()
+        self.fine_tune_thread = Thread(target=self.fineTuneLoop)
+        self.fine_tune_thread.start()
         
     def initCooldowns(self):
         self.cooldowns = {}
@@ -45,22 +44,37 @@ class GPTHandler(retroBot.channelHandler):
         sqlite3.register_converter("BOOLEAN", lambda v: bool(int(v)))
         cursor = connection.cursor()
         cursor.execute('PRAGMA journal_mode=WAL')
-        self.initMessageDB(cursor)
-        self.initConfigDB(cursor)
-        self.initModelDB(cursor)
         connection.commit()
         cursor.close()
+        self.initMessageDB(connection)
+        self.initModelDB(connection)
         connection.close()
 
-    def initMessageDB(self, cursor):
+    def initMessageDB(self, connection):
+        cursor = connection.cursor()
         cursor.execute('create table if not exists messages(message TEXT NOT NULL)')
+        connection.commit()
     
-    def initConfigDB(self, cursor):
-        cursor.execute('create table if not exists config(key TEXT NOT NULL, value TEXT)')
+    def initConfig(self):
+        self.max_tokens = self.parent.config['twitch']['channels'][self.channel]['max_tokens']
+        self.send_messages = self.parent.config['twitch']['channels'][self.channel]['send_messages']
+        self.generate_on = self.parent.config['twitch']['channels'][self.channel]['generate_on']
+        self.message_count_cutoff = self.parent.config['twitch']['channels'][self.channel]['message_count_cutoff']
+        self.ignored_users = [x.lower() for x in self.parent.config['twitch']['channels'][self.channel]['ignored_users']]
+        self.message_count = 0
 
-    def initModelDB(self, cursor):
+    def initModelDB(self, connection):
+        cursor = connection.cursor()
         cursor.execute('create table if not exists models(iteration INTEGER NOT NULL PRIMARY KEY, date TIMESTAMP NOT NULL, message_count INTEGER NOT NULL, model TEXT NOT NULL)')
-    
+        connection.commit()
+        cursor.execute('select COUNT(*) from models')
+        model_count = cursor.fetchone()[0]
+        if model_count == 0:
+            self.model = BASE_MODEL
+        else:
+            cursor.execute('select model from models ORDER BY iteration DESC LIMIT 1')
+            self.model = cursor.fetchone()[0]
+            
     def on_pubmsg(self, c, e):
         msg = message(e)
         if msg.username.lower() in self.ignored_users:
@@ -101,7 +115,7 @@ class GPTHandler(retroBot.channelHandler):
         if message:
             connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
             cursor = connection.cursor()
-            cursor.execute('insert into messages values (?)', (message))
+            cursor.execute('insert into messages values (?)', (message, ))
             connection.commit()
             cursor.close()
             connection.close()
@@ -111,20 +125,29 @@ class GPTHandler(retroBot.channelHandler):
             return False
     
     def filterMessage(self, message):
-        if self.parent.checkBlacklisted(message):
-            return False
+        #if self.parent.checkBlacklisted(message):
+        #    return False
         # Remove links
         # TODO: Fix
         message = re.sub(r"http\S+", "", message)
-        # Remove mentions
-        if self.parent.allow_mentions == False:
-            message = re.sub(r"@\S+", "", message)
-        # Remove just repeated messages.
-        words = message.split()
         # Space filtering
         message = re.sub(r" +", " ", message)
         message = message.strip()
         return message
+
+    def fineTuneLoop(self, poll_interval=60):
+        while True:
+            connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
+            cursor = connection.cursor()
+            cursor.execute('select count(*) from messages')
+            message_count = cursor.fetchone()[0]
+            if message_count > self.message_count_cutoff:
+                try:
+                    self.fineTuneModel(model=self.model)
+                except Exception as e:
+                    self.logger.error(f'The following exception has occurred when fine tuning the model: {e}')
+            else:
+                time.sleep(poll_interval)
 
     def fineTuneModel(self, poll_interval=POLL_INTERVAL, **kwargs):
 
@@ -185,7 +208,7 @@ class GPTHandler(retroBot.channelHandler):
             self.logger.error(f'Fine tuning model creation has failed!')
             return None
         else:
-            self.logger.error(f'Fine tuning model creation has exploded! My god!')
+            self.logger.error(f'Fine tuning model creation has exploded! Bah gawd!')
             return None
 
     def setModel(self, model, dataset_length, created_date):
@@ -210,7 +233,12 @@ class GPTHandler(retroBot.channelHandler):
     def formatDataSet(self, dataset):
         jsonl_content = ""
         for row in dataset:
-            jsonl_content += '{"prompt": "\n", "completion": "' + row[1] + '"}\n'
+            row_dict = {
+                'prompt': '\n',
+                'completion': row[1]
+            }
+            jsonl_content += json.dumps(row_dict) + '\n'
+        jsonl_content = bytes(jsonl_content, 'utf-8')
         return jsonl_content
     
     def uploadDataSet(self, dataset):
@@ -235,65 +263,68 @@ class GPTHandler(retroBot.channelHandler):
         connection.commit()
         cursor.execute('vacuum')
         connection.commit()
+        cursor.execute('select COUNT(*) from messages', (cutoff_row,))
+        self.message_count = cursor.fetchone()[0]
         cursor.close()
         connection.close()
     
     def handleCommands(self, msg):
-        cmd = msg.content.split(' ')[0][1:].lower()
-        if cmd == 'commands' and (datetime.datetime.now() - self.last_used[cmd]).total_seconds() >= self.cooldowns[cmd]:
-            self.send_message('You can find a list of my commands here: https://www.retrontology.com/index.php/neuralbronson-commands/')
-            self.last_used[cmd] = datetime.datetime.now()
-        elif cmd == 'speak' and (datetime.datetime.now() - self.last_used[cmd]).total_seconds() >= self.cooldowns[cmd]:
-            self.generateAndSendMessage()
-            self.last_used[cmd] = datetime.datetime.now()
-        if msg.mod or msg.broadcaster or msg.user_id in [54714257, 37749713]:
-            if cmd == 'clear':
-                if self.clear_logs_after:
-                    self.clear_logs_after = False
-                    self.parent.config.save()
-                    self.send_message("No longer clearing memory after message! MrDestructoid")
-                else:
-                    self.clear_logs_after = True
-                    self.parent.config.save()
-                    self.send_message("Clearing memory after every message! MrDestructoid")
-            elif cmd == 'wipe':
-                connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
-                cursor = connection.cursor()
-                cursor.execute('delete from messages')
-                connection.commit()
-                cursor.execute('vacuum')
-                cursor.close()
-                connection.close()
-                self.send_message("Wiped memory banks. MrDestructoid")
-            elif cmd == 'toggle':
-                if self.send_messages:
-                    self.send_messages = False
-                    self.parent.config.save()
-                    self.send_message("Messages will no longer be sent! MrDestructoid")
-                else:
-                    self.send_messages = True
-                    self.parent.config.save()
-                    self.send_message("Messages are now turned on! MrDestructoid")
-            elif cmd == 'unique':
-                if self.unique:
-                    self.unique = False
-                    self.parent.config.save()
-                    self.send_message("Messages will no longer be unique. MrDestructoid")
-                else:
-                    self.unique = True
-                    self.parent.config.save()
-                    self.send_message("Messages will now be unique. MrDestructoid")
-            elif cmd == 'setafter':
-                try:
-                    stringNum = msg.content.split(' ')[1]
-                    if stringNum != None:
-                        num = int(stringNum)
-                        if num <= 0:
-                            raise Exception
-                        self.generate_on = num
-                        self.parent.config.save()
-                        self.send_message("Messages will now be sent after " + self.generate_on + " chat messages. MrDestructoid")
-                except:
-                        self.send_message("Current value: " + str(self.generate_on) + ". To set, use: setafter [number of messages]")
-            elif cmd == 'isalive':
-                self.send_message("Yeah, I'm alive and learning. MrDestructoid")
+        return None
+        # cmd = msg.content.split(' ')[0][1:].lower()
+        # if cmd == 'commands' and (datetime.datetime.now() - self.last_used[cmd]).total_seconds() >= self.cooldowns[cmd]:
+        #     self.send_message('You can find a list of my commands here: https://www.retrontology.com/index.php/neuralbronson-commands/')
+        #     self.last_used[cmd] = datetime.datetime.now()
+        # elif cmd == 'speak' and (datetime.datetime.now() - self.last_used[cmd]).total_seconds() >= self.cooldowns[cmd]:
+        #     self.generateAndSendMessage()
+        #     self.last_used[cmd] = datetime.datetime.now()
+        # if msg.mod or msg.broadcaster or msg.user_id in [54714257, 37749713]:
+        #     if cmd == 'clear':
+        #         if self.clear_logs_after:
+        #             self.clear_logs_after = False
+        #             self.parent.config.save()
+        #             self.send_message("No longer clearing memory after message! MrDestructoid")
+        #         else:
+        #             self.clear_logs_after = True
+        #             self.parent.config.save()
+        #             self.send_message("Clearing memory after every message! MrDestructoid")
+        #     elif cmd == 'wipe':
+        #         connection = sqlite3.connect(self.db_file, timeout=self.db_timeout)
+        #         cursor = connection.cursor()
+        #         cursor.execute('delete from messages')
+        #         connection.commit()
+        #         cursor.execute('vacuum')
+        #         cursor.close()
+        #         connection.close()
+        #         self.send_message("Wiped memory banks. MrDestructoid")
+        #     elif cmd == 'toggle':
+        #         if self.send_messages:
+        #             self.send_messages = False
+        #             self.parent.config.save()
+        #             self.send_message("Messages will no longer be sent! MrDestructoid")
+        #         else:
+        #             self.send_messages = True
+        #             self.parent.config.save()
+        #             self.send_message("Messages are now turned on! MrDestructoid")
+        #     elif cmd == 'unique':
+        #         if self.unique:
+        #             self.unique = False
+        #             self.parent.config.save()
+        #             self.send_message("Messages will no longer be unique. MrDestructoid")
+        #         else:
+        #             self.unique = True
+        #             self.parent.config.save()
+        #             self.send_message("Messages will now be unique. MrDestructoid")
+        #     elif cmd == 'setafter':
+        #         try:
+        #             stringNum = msg.content.split(' ')[1]
+        #             if stringNum != None:
+        #                 num = int(stringNum)
+        #                 if num <= 0:
+        #                     raise Exception
+        #                 self.generate_on = num
+        #                 self.parent.config.save()
+        #                 self.send_message("Messages will now be sent after " + self.generate_on + " chat messages. MrDestructoid")
+        #         except:
+        #                 self.send_message("Current value: " + str(self.generate_on) + ". To set, use: setafter [number of messages]")
+        #     elif cmd == 'isalive':
+        #         self.send_message("Yeah, I'm alive and learning. MrDestructoid")

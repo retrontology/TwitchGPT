@@ -5,23 +5,23 @@ import re
 import logging
 import logging.handlers
 import os
+import openai
 
 class GPTBot(retroBot.retroBot):
 
     def __init__(self, config):
         self.config = config
-        self.cull_over = config['markov']['train_over']
-        self.time_to_cull = config['markov']['time_to_train']
-        self.blacklist_file = config['markov']['blacklist_file']
-        self.blacklist_words = self.load_blacklist(self.blacklist_file)
+        openai.api_key = config['gpt']['api_key']
+        #self.blacklist_file = config['gpt']['blacklist_file']
+        #self.blacklist_words = self.load_blacklist(self.blacklist_file)
         self.username = config['twitch']['username']
         self.client_id = config['twitch']['client_id']
         self.client_secret = config['twitch']['client_secret']
         for channel in config['twitch']['channels']:
             channel_config = config['twitch']['channels'][channel]
-            for setting in config['markov']['defaults']:
+            for setting in config['gpt']['defaults']:
                 if not setting in channel_config or not channel_config[setting]:
-                    channel_config[setting] = config['markov']['defaults'][setting]
+                    channel_config[setting] = config['gpt']['defaults'][setting]
             self.config.save()
         super(GPTBot, self).__init__(
             config['twitch']['username'],
